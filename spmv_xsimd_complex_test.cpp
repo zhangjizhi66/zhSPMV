@@ -5,6 +5,8 @@
 #include <fstream>
 #include <filesystem>
 #include <vector>
+#include <set>
+#include <random>
 #include <algorithm>
 #include <cmath>
 #include <numeric>
@@ -20,14 +22,24 @@
 #define INDEXTYPE int
 #define SIMD_WIDTH (VEC_LENGTH / sizeof(DATATYPE) / 8)
 
-#define INROW_SIMD
+// Parameters
+#define DEFAULT_NLOOPS 1000
+#define DEFAULT_NTHREADS 1
+#define DEFAULT_PRECISION 1e-14
 #define SIMD_USAGE_RATE 0.5  // lower limit, else apply in-row simd
 #define LONG_ROW_LENGTH 100  // lower limit, else apply in-row simd
+
+// Optional Function
+#define INROW_SIMD
 
 template <typename T, typename U>
 class SIMDMAT {
 public:
-    SIMDMAT(CSRMAT<T>& csrmat);
+    SIMDMAT(CSR::CSRMAT<T> *csrmat);
+    SIMDMAT(const SIMDMAT &) = delete;  // 禁止拷贝构造函数
+    SIMDMAT &operator=(const SIMDMAT &) = delete;  // 禁止拷贝赋值函数
+    SIMDMAT(SIMDMAT&&) = default;
+    SIMDMAT& operator=(SIMDMAT&&) = default;
     ~SIMDMAT() {
         free(nnz_val);
         free(col_idx);
@@ -51,8 +63,8 @@ public:
 };
 
 template <typename T, typename U>
-SIMDMAT<T, U>::SIMDMAT(CSRMAT<T>& csrmat) {
-    nrows = csrmat.nrows;
+SIMDMAT<T, U>::SIMDMAT(CSR::CSRMAT<T> *csrmat) {
+    nrows = csrmat->nrows;
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -67,8 +79,8 @@ SIMDMAT<T, U>::SIMDMAT(CSRMAT<T>& csrmat) {
     rows.reserve(2*nrows);
     for (int i = 0; i < nrows; i++) {
         rows[i].rawidx = i;
-        rows[i].first_col_idx = csrmat.col_idx[csrmat.row_ptr[i]];
-        rows[i].length = csrmat.row_ptr[i + 1] - csrmat.row_ptr[i];
+        rows[i].first_col_idx = csrmat->col_idx[csrmat->row_ptr[i]];
+        rows[i].length = csrmat->row_ptr[i + 1] - csrmat->row_ptr[i];
     }
     std::sort(rows.begin(), rows.end(), [](const ROW &a, const ROW &b) { 
         if ( a.length == b.length )
@@ -100,12 +112,21 @@ SIMDMAT<T, U>::SIMDMAT(CSRMAT<T>& csrmat) {
         if ( !simd_verify ) {
             in_row_simd.push_back(i);
             in_row_simd_data.push_back(rows[i]);
-            std::cout << "row " << rows[i].rawidx << " is in-row simd row, length: " << rows[i].length << '\n';
+            std::cout << "Extremely long row:" << '\t' 
+                      << "index = " << rows[i].rawidx << '\t' 
+                      << "length = " << rows[i].length << '\n';
             i++;
         } else
             i += SIMD_WIDTH / 2;
     }
     in_row_simd.push_back(nrows);
+
+    if ( in_row_simd.size() > 1 )
+#ifdef INROW_SIMD
+        std::cout << '\n' << "Using in-row SIMD for extremely long rows ..." << '\n' << std::endl;
+#else
+        std::cout << '\n' << "Using scalar operation for extremely long rows ..." << '\n' << std::endl;
+#endif
 
     nrows_inrow_simd = in_row_simd.size() - 1;
     nrows_crossrow_simd = nrows - nrows_inrow_simd;
@@ -149,23 +170,23 @@ SIMDMAT<T, U>::SIMDMAT(CSRMAT<T>& csrmat) {
 
     // cross-row simd blocks
     for (int irow = 0; irow < int(nrows - nrows_inrow_simd - SIMD_WIDTH / 2); irow += SIMD_WIDTH / 2) {
-        int max_idx = csrmat.row_ptr[sort_raw[irow]+1] - csrmat.row_ptr[sort_raw[irow]];
+        int max_idx = csrmat->row_ptr[sort_raw[irow]+1] - csrmat->row_ptr[sort_raw[irow]];
         for (int idx = 0; idx < max_idx; idx++) {
             for (int i = 0; i < int(SIMD_WIDTH / 2); i++) {
                 int raw_row_idx = sort_raw[irow + i];
-                if ( csrmat.row_ptr[raw_row_idx + 1] - csrmat.row_ptr[raw_row_idx] <= idx ) {
+                if ( csrmat->row_ptr[raw_row_idx + 1] - csrmat->row_ptr[raw_row_idx] <= idx ) {
                     nnz_val[simd_ptr_idx] = 0;
-                    col_idx[simd_ptr_idx] = csrmat.col_idx[csrmat.row_ptr[sort_raw[irow]] + idx];
+                    col_idx[simd_ptr_idx] = csrmat->col_idx[csrmat->row_ptr[sort_raw[irow]] + idx];
                     simd_ptr_idx++;
                     nnz_val[simd_ptr_idx] = 0;
-                    col_idx[simd_ptr_idx] = csrmat.col_idx[csrmat.row_ptr[sort_raw[irow]] + idx];
+                    col_idx[simd_ptr_idx] = csrmat->col_idx[csrmat->row_ptr[sort_raw[irow]] + idx];
                 } else {
-                    int idx_temp = csrmat.row_ptr[raw_row_idx] + idx;
-                    nnz_val[simd_ptr_idx] = csrmat.nnz_val[idx_temp];
-                    col_idx[simd_ptr_idx] = csrmat.col_idx[idx_temp];
+                    int idx_temp = csrmat->row_ptr[raw_row_idx] + idx;
+                    nnz_val[simd_ptr_idx] = csrmat->nnz_val[idx_temp];
+                    col_idx[simd_ptr_idx] = csrmat->col_idx[idx_temp];
                     simd_ptr_idx++;
-                    nnz_val[simd_ptr_idx] = csrmat.nnz_val[idx_temp];
-                    col_idx[simd_ptr_idx] = csrmat.col_idx[idx_temp];
+                    nnz_val[simd_ptr_idx] = csrmat->nnz_val[idx_temp];
+                    col_idx[simd_ptr_idx] = csrmat->col_idx[idx_temp];
                 }
                 simd_ptr_idx++;
             }
@@ -176,30 +197,30 @@ SIMDMAT<T, U>::SIMDMAT(CSRMAT<T>& csrmat) {
     // the last cross-row simd block
     {
         int irow = (SIMD_WIDTH / 2) * (isimd - 1);
-        int max_idx = csrmat.row_ptr[sort_raw[irow] + 1] - csrmat.row_ptr[sort_raw[irow]];
+        int max_idx = csrmat->row_ptr[sort_raw[irow] + 1] - csrmat->row_ptr[sort_raw[irow]];
         for (int idx = 0; idx < max_idx; idx++) {
             for (int i = 0; i < int(SIMD_WIDTH / 2); i++) {
                 int sort_row_idx = irow + i;
                 int raw_row_idx = sort_raw[sort_row_idx];
                 if ( sort_row_idx >= nrows - nrows_inrow_simd ) {  // use col_idx in the first row in the simd block
                     nnz_val[simd_ptr_idx] = 0;
-                    col_idx[simd_ptr_idx] = csrmat.col_idx[csrmat.row_ptr[sort_raw[irow]] + idx];
+                    col_idx[simd_ptr_idx] = csrmat->col_idx[csrmat->row_ptr[sort_raw[irow]] + idx];
                     simd_ptr_idx++;
                     nnz_val[simd_ptr_idx] = 0;
-                    col_idx[simd_ptr_idx] = csrmat.col_idx[csrmat.row_ptr[sort_raw[irow]] + idx];
-                } else if ( csrmat.row_ptr[raw_row_idx + 1] - csrmat.row_ptr[raw_row_idx] <= idx ) {
+                    col_idx[simd_ptr_idx] = csrmat->col_idx[csrmat->row_ptr[sort_raw[irow]] + idx];
+                } else if ( csrmat->row_ptr[raw_row_idx + 1] - csrmat->row_ptr[raw_row_idx] <= idx ) {
                     nnz_val[simd_ptr_idx] = 0;
-                    col_idx[simd_ptr_idx] = csrmat.col_idx[csrmat.row_ptr[sort_raw[irow]] + idx];
+                    col_idx[simd_ptr_idx] = csrmat->col_idx[csrmat->row_ptr[sort_raw[irow]] + idx];
                     simd_ptr_idx++;
                     nnz_val[simd_ptr_idx] = 0;
-                    col_idx[simd_ptr_idx] = csrmat.col_idx[csrmat.row_ptr[sort_raw[irow]] + idx];
+                    col_idx[simd_ptr_idx] = csrmat->col_idx[csrmat->row_ptr[sort_raw[irow]] + idx];
                 } else {
-                    int idx_temp = csrmat.row_ptr[raw_row_idx] + idx;
-                    nnz_val[simd_ptr_idx] = csrmat.nnz_val[idx_temp];
-                    col_idx[simd_ptr_idx] = csrmat.col_idx[idx_temp];
+                    int idx_temp = csrmat->row_ptr[raw_row_idx] + idx;
+                    nnz_val[simd_ptr_idx] = csrmat->nnz_val[idx_temp];
+                    col_idx[simd_ptr_idx] = csrmat->col_idx[idx_temp];
                     simd_ptr_idx++;
-                    nnz_val[simd_ptr_idx] = csrmat.nnz_val[idx_temp];
-                    col_idx[simd_ptr_idx] = csrmat.col_idx[idx_temp];
+                    nnz_val[simd_ptr_idx] = csrmat->nnz_val[idx_temp];
+                    col_idx[simd_ptr_idx] = csrmat->col_idx[idx_temp];
                 }
                 simd_ptr_idx++;
             }
@@ -209,14 +230,14 @@ SIMDMAT<T, U>::SIMDMAT(CSRMAT<T>& csrmat) {
 
     // in-row simd blocks
     for (int irow = nrows - nrows_inrow_simd; irow < nrows; irow++) {
-        int max_idx = csrmat.row_ptr[sort_raw[irow]+1] - csrmat.row_ptr[sort_raw[irow]];
-        int start_idx = csrmat.row_ptr[sort_raw[irow]];
+        int max_idx = csrmat->row_ptr[sort_raw[irow]+1] - csrmat->row_ptr[sort_raw[irow]];
+        int start_idx = csrmat->row_ptr[sort_raw[irow]];
 
         // conductance
         for (int idx = 0; idx < max_idx; idx++) {
             int this_idx = start_idx + idx;
-            nnz_val[simd_ptr_idx] = csrmat.nnz_val[this_idx];
-            col_idx[simd_ptr_idx] = csrmat.col_idx[this_idx];
+            nnz_val[simd_ptr_idx] = csrmat->nnz_val[this_idx];
+            col_idx[simd_ptr_idx] = csrmat->col_idx[this_idx];
             simd_ptr_idx++;
         }
         if ( max_idx % SIMD_WIDTH != 0 ) {
@@ -224,7 +245,7 @@ SIMDMAT<T, U>::SIMDMAT(CSRMAT<T>& csrmat) {
             int nmasks = SIMD_WIDTH - max_idx % SIMD_WIDTH;
             for (int i = 0; i < nmasks; i++) {
                 nnz_val[simd_ptr_idx] = 0;
-                col_idx[simd_ptr_idx] = csrmat.col_idx[end_idx];
+                col_idx[simd_ptr_idx] = csrmat->col_idx[end_idx];
                 simd_ptr_idx++;
             }
         }
@@ -233,8 +254,8 @@ SIMDMAT<T, U>::SIMDMAT(CSRMAT<T>& csrmat) {
         // capacitance
         for (int idx = 0; idx < max_idx; idx++) {
             int this_idx = start_idx + idx;
-            nnz_val[simd_ptr_idx] = csrmat.nnz_val[this_idx];
-            col_idx[simd_ptr_idx] = csrmat.col_idx[this_idx];
+            nnz_val[simd_ptr_idx] = csrmat->nnz_val[this_idx];
+            col_idx[simd_ptr_idx] = csrmat->col_idx[this_idx];
             simd_ptr_idx++;
         }
         if ( max_idx % SIMD_WIDTH != 0 ) {
@@ -242,7 +263,7 @@ SIMDMAT<T, U>::SIMDMAT(CSRMAT<T>& csrmat) {
             int nmasks = SIMD_WIDTH - max_idx % SIMD_WIDTH;
             for (int i = 0; i < nmasks; i++) {
                 nnz_val[simd_ptr_idx] = 0;
-                col_idx[simd_ptr_idx] = csrmat.col_idx[end_idx];
+                col_idx[simd_ptr_idx] = csrmat->col_idx[end_idx];
                 simd_ptr_idx++;
             }
         }
@@ -323,42 +344,33 @@ void SPMV_SIMD_complex(SIMDMAT<T, U> &simdmat, T *x, T *y, int nthreads = 1) {
 }
 
 template <typename T>
-void SPMV_CSR_complex(CSRMAT<T> &csrmat, T *x, T *y, int nthreads = 1) {
+void SPMV_CSR_complex(CSR::CSRMAT<T> *csrmat, T *x, T *y, int nthreads = 1) {
     //#pragma omp parallel for num_threads(nthreads) schedule(dynamic)
-    for (int i = 0; i < csrmat.nrows; i++) {
+    for (int i = 0; i < csrmat->nrows; i++) {
         y[2 * i] = 0;
-        for (int j = csrmat.row_ptr[i]; j < csrmat.row_ptr[i + 1]; j++)
-            y[2 * i] += csrmat.nnz_val[j] * x[csrmat.col_idx[j]];
+        for (int j = csrmat->row_ptr[i]; j < csrmat->row_ptr[i + 1]; j++)
+            y[2 * i] += csrmat->nnz_val[j] * x[csrmat->col_idx[j]];
 
         y[2 * i + 1] = 0;
-        for (int j = csrmat.row_ptr[i]; j < csrmat.row_ptr[i + 1]; j++)
-            y[2 * i + 1] += csrmat.nnz_val[j] * x[csrmat.col_idx[j]];
+        for (int j = csrmat->row_ptr[i]; j < csrmat->row_ptr[i + 1]; j++)
+            y[2 * i + 1] += csrmat->nnz_val[j] * x[csrmat->col_idx[j]];
     }
 }
 
 int main(int argc, char *argv[]) {
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <matrix_file>" << std::endl;
-        exit(1);
-    }
+    
+    CSR::CSRMAT<DATATYPE> *csrmat;
+    
+    int nloops = DEFAULT_NLOOPS;
+    int nthreads = DEFAULT_NTHREADS;
+    double precision = DEFAULT_PRECISION;
 
-    std::string MtxFileName = argv[1];
-    double precision = 1e-14;
-    //if ( argc > 2 )
-    //    precision = atof(argv[2]);
-    int nloops = 1000;
-    if ( argc > 2 )
-        nloops = atoi(argv[2]);
-    int nthreads = 1;
-    if ( argc > 3 )
-        nthreads = atoi(argv[3]);
+    CSR::ParseArgs<DATATYPE>(argc, argv, csrmat, nloops, nthreads, precision);
+    
+    std::cout << '\n' << "size:" << '\t' << csrmat->nrows << " x " << csrmat->ncols << '\n' << "nnz:" << '\t' << csrmat->nnzs << std::endl;
+    std::cout << std::setprecision(3) << std::endl;
 
     ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-    // read matrix
-    CSRMAT<DATATYPE> csrmat(MtxFileName);
-    std::cout << '\n' << "size:" << '\t' << csrmat.nrows << " x " << csrmat.ncols << '\n' << "nnz:" << '\t' << csrmat.nnzs << std::endl;
-    std::cout << std::setprecision(3) << std::endl;
 
     // preprocess matrix
     auto start = std::chrono::high_resolution_clock::now();
@@ -370,12 +382,12 @@ int main(int argc, char *argv[]) {
     std::cout << "Time of preprocessing:" << '\t' << time_preprocess << " us" << '\n' << std::endl;
 
     // initialize vectors
-    DATATYPE *x = (DATATYPE*)malloc(csrmat.ncols * sizeof(DATATYPE));
-    DATATYPE *y1 = (DATATYPE*)malloc(2 * csrmat.nrows * sizeof(DATATYPE));
-    DATATYPE *y2 = (DATATYPE*)malloc(2 * csrmat.nrows * sizeof(DATATYPE));
-    for (int i = 0; i < csrmat.ncols; i++)
+    DATATYPE *x = (DATATYPE*)malloc(csrmat->ncols * sizeof(DATATYPE));
+    DATATYPE *y1 = (DATATYPE*)malloc(2 * csrmat->nrows * sizeof(DATATYPE));
+    DATATYPE *y2 = (DATATYPE*)malloc(2 * csrmat->nrows * sizeof(DATATYPE));
+    for (int i = 0; i < csrmat->ncols; i++)
         x[i] = static_cast<DATATYPE>(1);
-    for (int i = 0; i < 2 * csrmat.nrows; i++) {
+    for (int i = 0; i < 2 * csrmat->nrows; i++) {
         y1[i] = 0;
         y2[i] = 0;
     }
@@ -392,7 +404,7 @@ int main(int argc, char *argv[]) {
         SPMV_CSR_complex<DATATYPE>(csrmat, x, y1, nthreads);
     auto end1 = std::chrono::high_resolution_clock::now();
     double time_spmv_csr = std::chrono::duration_cast<std::chrono::microseconds>(end1 - start1).count();
-    std::cout << "Time of CSR SPMV:" << '\t' << time_spmv_csr / nloops << " us" << '\t' << '\t' << 2 * csrmat.nnzs * 2 / (time_spmv_csr / nloops) / 1000 << " GFLOPS" << std::endl;
+    std::cout << "Time of CSR SPMV:" << '\t' << time_spmv_csr / nloops << " us" << '\t' << '\t' << 2 * csrmat->nnzs * 2 / (time_spmv_csr / nloops) / 1000 << " GFLOPS" << std::endl;
 
     ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -412,7 +424,7 @@ int main(int argc, char *argv[]) {
         SPMV_SIMD_complex<DATATYPE, INDEXTYPE, Arch>(simdmat, x, y2, nthreads);
     auto end2 = std::chrono::high_resolution_clock::now();
     double time_spmv_simd = std::chrono::duration_cast<std::chrono::microseconds>(end2 - start2).count();
-    std::cout << "Time of SIMD SPMV:" << '\t' << time_spmv_simd / nloops << " us" << '\t' << '\t' << 2 * csrmat.nnzs * 2 / (time_spmv_simd / nloops) / 1000 << " GFLOPS" << std::endl;
+    std::cout << "Time of SIMD SPMV:" << '\t' << time_spmv_simd / nloops << " us" << '\t' << '\t' << 2 * csrmat->nnzs * 2 / (time_spmv_simd / nloops) / 1000 << " GFLOPS" << std::endl;
     std::cout << "Speedup:" << '\t' << '\t' << time_spmv_csr / time_spmv_simd << "x" << '\n' << std::endl;
 
     ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -422,31 +434,9 @@ int main(int argc, char *argv[]) {
     SPMV_SIMD_complex<DATATYPE, INDEXTYPE, Arch>(simdmat, x, y2);
 
     // compare y1 and y2
-    for (int i = 0; i < 2 * csrmat.nrows; i++)
+    for (int i = 0; i < 2 * csrmat->nrows; i++)
         if (fabs(y1[i] - y2[i]) > precision && fabs(y1[i]-y2[i]) / fabs(y1[i]) > precision)
             std::cout << std::setprecision(20) << "Wrong result at row " << i << ": " << y1[i] << " vs " << y2[i] << std::endl;
-    
-    ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-    // output performance data
-    std::filesystem::path mtxpath = MtxFileName;
-    std::string mtxname = mtxpath.stem().string();
-    if ( !std::filesystem::exists("perf") )
-        std::filesystem::create_directory("perf");
-
-    double time_temp = -1;
-    if ( std::filesystem::exists("perf/"+mtxname+"_xsimd"+std::to_string(VEC_LENGTH)+"d_complex_test.txt") ) {
-        std::ifstream ifs("perf/"+mtxname+"_xsimd"+std::to_string(VEC_LENGTH)+"d_complex_test.txt");
-        double a;
-        ifs >> a >> time_temp;
-        ifs.close();
-    }
-    if ( time_temp < time_spmv_simd / nloops && time_temp > 0 )
-        time_spmv_simd = time_temp;
-
-    std::ofstream ofs("perf/"+mtxname+"_xsimd"+std::to_string(VEC_LENGTH)+"d_complex_test.txt");
-    ofs << time_spmv_simd / nloops;
-    ofs.close();
 
     free(x);
     free(y1);

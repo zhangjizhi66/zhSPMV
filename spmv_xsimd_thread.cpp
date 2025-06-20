@@ -10,9 +10,12 @@
 #include <algorithm>
 #include <cmath>
 #include <numeric>
+#include <thread>
 #include <ctime>
 #include <chrono>
 #include <immintrin.h>
+#include <unistd.h>
+#include <omp.h>
 #include "xsimd/xsimd.hpp"
 #include "new_gather_scatter.hpp"
 #include "csr.h"
@@ -31,11 +34,12 @@
 
 // Optional Function
 #define INROW_SIMD
+#define THREAD_TIME_TEST
 
 template <typename T, typename U>
 class SIMDMAT {
 public:
-    SIMDMAT(int csr_nrows, int *csr_row_ptr, U *csr_col_idx, T *csr_nnz_val);
+    SIMDMAT(int csr_nrows, int *csr_row_ptr, U *csr_col_idx, T *csr_nnz_val, const int nthreads);
     SIMDMAT(const SIMDMAT &) = delete;  // 禁止拷贝构造函数
     SIMDMAT &operator=(const SIMDMAT &) = delete;  // 禁止拷贝赋值函数
     SIMDMAT(SIMDMAT&&) = default;
@@ -48,9 +52,11 @@ public:
     }
 
     int nrows;
-    int nsimdblocks_crossrow;
-    int nsimdblocks_inrow;
+    int nnzs;
+    int nsimdblocks;
+
     int nrows_crossrow_simd;
+    int nrows_scalar;
     int nrows_inrow_simd;
 
     T *nnz_val;
@@ -61,8 +67,9 @@ public:
 };
 
 template <typename T, typename U>
-SIMDMAT<T, U>::SIMDMAT(int csr_nrows, int *csr_row_ptr, U *csr_col_idx, T *csr_nnz_val) {
+SIMDMAT<T, U>::SIMDMAT(int csr_nrows, int *csr_row_ptr, U *csr_col_idx, T *csr_nnz_val, const int nthreads) {
     nrows = csr_nrows;
+    nnzs = csr_row_ptr[csr_nrows];
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -71,6 +78,7 @@ SIMDMAT<T, U>::SIMDMAT(int csr_nrows, int *csr_row_ptr, U *csr_col_idx, T *csr_n
         int rawidx;
         int first_col_idx;
         int length;
+        ROW(int a = -1, int b = -1, int c = 0) : rawidx(a), first_col_idx(b), length(c) {}
     };
 
     std::vector<ROW> rows(nrows);
@@ -127,7 +135,8 @@ SIMDMAT<T, U>::SIMDMAT(int csr_nrows, int *csr_row_ptr, U *csr_col_idx, T *csr_n
 #endif
 
     nrows_inrow_simd = in_row_simd.size() - 1;
-    nrows_crossrow_simd = nrows - nrows_inrow_simd;
+    nrows_scalar = ( nrows - nrows_inrow_simd ) % SIMD_WIDTH;
+    nrows_crossrow_simd = nrows - nrows_inrow_simd - nrows_scalar;
     for (int j = 0; j < nrows_inrow_simd; j++) {
         for (int i = in_row_simd[j] + 1; i < in_row_simd[j+1]; i++) {
             rows[i - j - 1].rawidx = rows[i].rawidx;
@@ -146,24 +155,26 @@ SIMDMAT<T, U>::SIMDMAT(int csr_nrows, int *csr_row_ptr, U *csr_col_idx, T *csr_n
 
     /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-    int Nsimd = 0;
-    for (int i = 0; i < nrows - nrows_inrow_simd; i += SIMD_WIDTH)
-        Nsimd += rows[i].length;
-    for (int i = nrows - nrows_inrow_simd; i < nrows; i++)
-        Nsimd += std::ceil((double)rows[i].length / SIMD_WIDTH);
+    int N = 0;
+    for (int i = 0; i < nrows_crossrow_simd; i += SIMD_WIDTH)
+        N += rows[i].length;
+    for (int i = nrows_crossrow_simd + nrows_scalar; i < nrows; i++)
+        N += std::ceil((double)rows[i].length / SIMD_WIDTH);
+    N *= SIMD_WIDTH;
+    for (int i = nrows_crossrow_simd; i < nrows_crossrow_simd + nrows_scalar; i++)
+        N += rows[i].length;
 
-    nsimdblocks_crossrow = std::ceil((double)(nrows - nrows_inrow_simd) / SIMD_WIDTH);
-    nsimdblocks_inrow = nrows_inrow_simd;
+    nsimdblocks = N / SIMD_WIDTH;
 
-    posix_memalign((void**)&nnz_val, VEC_LENGTH / 8, Nsimd * SIMD_WIDTH * sizeof(T));
-    posix_memalign((void**)&col_idx, VEC_LENGTH / 8, Nsimd * SIMD_WIDTH * sizeof(U));
-    simd_ptr = (int*)malloc((nsimdblocks_crossrow + nsimdblocks_inrow + 1) * sizeof(int));
+    posix_memalign((void**)&nnz_val, VEC_LENGTH / 8, N * sizeof(T));
+    posix_memalign((void**)&col_idx, VEC_LENGTH / 8, N * sizeof(U));
+    simd_ptr = (int*)malloc((nrows_crossrow_simd / SIMD_WIDTH + nrows_scalar + nrows_inrow_simd + 1) * sizeof(int));
 
     int simd_ptr_idx = 0, isimd = 0;
     simd_ptr[isimd++] = 0;
 
     // cross-row simd blocks
-    for (int irow = 0; irow < int(nrows - nrows_inrow_simd - SIMD_WIDTH); irow += SIMD_WIDTH) {
+    for (int irow = 0; irow < nrows_crossrow_simd; irow += SIMD_WIDTH) {
         int max_idx = csr_row_ptr[sort_raw[irow]+1] - csr_row_ptr[sort_raw[irow]];
         for (int idx = 0; idx < max_idx; idx++) {
             for (int i = 0; i < int(SIMD_WIDTH); i++) {
@@ -182,33 +193,8 @@ SIMDMAT<T, U>::SIMDMAT(int csr_nrows, int *csr_row_ptr, U *csr_col_idx, T *csr_n
         simd_ptr[isimd++] = simd_ptr_idx;
     }
 
-    // the last cross-row simd block
-    {
-        int irow = SIMD_WIDTH * (isimd - 1);
-        int max_idx = csr_row_ptr[sort_raw[irow] + 1] - csr_row_ptr[sort_raw[irow]];
-        for (int idx = 0; idx < max_idx; idx++) {
-            for (int i = 0; i < int(SIMD_WIDTH); i++) {
-                int sort_row_idx = irow + i;
-                int raw_row_idx = sort_raw[sort_row_idx];
-                if ( sort_row_idx >= nrows - nrows_inrow_simd ) {  // use col_idx in the first row in the simd block
-                    nnz_val[simd_ptr_idx] = 0;
-                    col_idx[simd_ptr_idx] = csr_col_idx[csr_row_ptr[sort_raw[irow]] + idx];
-                } else if ( csr_row_ptr[raw_row_idx + 1] - csr_row_ptr[raw_row_idx] <= idx ) {
-                    nnz_val[simd_ptr_idx] = 0;
-                    col_idx[simd_ptr_idx] = csr_col_idx[csr_row_ptr[sort_raw[irow]] + idx];
-                } else {
-                    int idx_temp = csr_row_ptr[raw_row_idx] + idx;
-                    nnz_val[simd_ptr_idx] = csr_nnz_val[idx_temp];
-                    col_idx[simd_ptr_idx] = csr_col_idx[idx_temp];
-                }
-                simd_ptr_idx++;
-            }
-        }
-        simd_ptr[isimd++] = simd_ptr_idx;
-    }
-
-    // in-row simd blocks
-    for (int irow = nrows - nrows_inrow_simd; irow < nrows; irow++) {
+    // scalar rows & in-row simd rows
+    for (int irow = nrows_crossrow_simd; irow < nrows; irow++) {
         int max_idx = csr_row_ptr[sort_raw[irow] + 1] - csr_row_ptr[sort_raw[irow]];
         int start_idx = csr_row_ptr[sort_raw[irow]];
         for (int idx = 0; idx < max_idx; idx++) {
@@ -217,7 +203,8 @@ SIMDMAT<T, U>::SIMDMAT(int csr_nrows, int *csr_row_ptr, U *csr_col_idx, T *csr_n
             col_idx[simd_ptr_idx] = csr_col_idx[this_idx];
             simd_ptr_idx++;
         }
-        if ( max_idx % SIMD_WIDTH != 0 ) {
+#ifdef INROW_SIMD
+        if ( max_idx % SIMD_WIDTH != 0 && irow >= nrows_crossrow_simd + nrows_scalar ) {
             int end_idx = start_idx + max_idx;
             int nmasks = SIMD_WIDTH - max_idx % SIMD_WIDTH;
             for (int i = 0; i < nmasks; i++) {
@@ -226,65 +213,106 @@ SIMDMAT<T, U>::SIMDMAT(int csr_nrows, int *csr_row_ptr, U *csr_col_idx, T *csr_n
                 simd_ptr_idx++;
             }
         }
+#endif
         simd_ptr[isimd++] = simd_ptr_idx;
     }
 }
 
 template <typename T, typename U, class Arch>
-void SPMV_SIMD(SIMDMAT<T, U> &simdmat, T *x, T *y, int nthreads = 1) {
+void SPMV_SIMD_thread(SIMDMAT<T, U> &simdmat, T *x, T *y) {
     using VAL_VEC_TYPE = xsimd::batch<T, Arch>;
     using IDX_VEC_TYPE = xsimd::batch<U, Arch>;
 
     // cross-row simd blocks
-    int end_simd = simdmat.nsimdblocks_crossrow;
-    for (int isimd = 0; isimd < end_simd; isimd++) {
+    int start_simd = 0;
+    int end_simd = simdmat.nrows_crossrow_simd / SIMD_WIDTH;
+    for (int isimd = start_simd; isimd < end_simd; isimd++) {
         VAL_VEC_TYPE y_vec(0);
         int start_idx = simdmat.simd_ptr[isimd];
         int end_idx = simdmat.simd_ptr[isimd + 1];
         for (int idx = start_idx; idx < end_idx; idx += SIMD_WIDTH) {
             IDX_VEC_TYPE idx_vec = IDX_VEC_TYPE::load_unaligned(&simdmat.col_idx[idx]);
             VAL_VEC_TYPE x_vec = VAL_VEC_TYPE::gather(x, idx_vec);
-            VAL_VEC_TYPE val_vec = VAL_VEC_TYPE::load_aligned(&simdmat.nnz_val[idx]);
+            VAL_VEC_TYPE val_vec = VAL_VEC_TYPE::load_unaligned(&simdmat.nnz_val[idx]);
             y_vec = xsimd::fma(val_vec, x_vec, y_vec);
         }
-        if ( isimd == end_simd - 1 && simdmat.nrows_crossrow_simd % SIMD_WIDTH != 0 ) {
-            double y_arr[SIMD_WIDTH];
-            y_vec.store_unaligned(y_arr);
-            int end_i = simdmat.nrows_crossrow_simd % SIMD_WIDTH;
-            for (int i = 0; i < end_i; i++)
-                y[simdmat.sort_raw[isimd * SIMD_WIDTH + i]] = y_arr[i];
-        } else {
-            IDX_VEC_TYPE row_idx_vec = IDX_VEC_TYPE::load_unaligned(&simdmat.sort_raw[isimd * SIMD_WIDTH]);
-            y_vec.scatter(y, row_idx_vec);
-        }
+        IDX_VEC_TYPE row_idx_vec = IDX_VEC_TYPE::load_unaligned(&simdmat.sort_raw[isimd * SIMD_WIDTH]);
+        y_vec.scatter(y, row_idx_vec);
     }
 
-    // in-row simd blocks
-    int start_row_idx_inrow = simdmat.nrows - simdmat.nrows_inrow_simd;
-    int nsimdblocks = simdmat.nsimdblocks_crossrow + simdmat.nsimdblocks_inrow;
-    for (int isimd = simdmat.nsimdblocks_crossrow; isimd < nsimdblocks; isimd++) {
+    // scalar rows & in-row simd rows
+    int nsimdblocks1 = simdmat.nrows_crossrow_simd / SIMD_WIDTH;
+    int nsimdblocks2 = nsimdblocks1 + simdmat.nrows_scalar;
+    int nsimdblocks3 = nsimdblocks2 + simdmat.nrows_inrow_simd;
+    for (int isimd = nsimdblocks1; isimd < nsimdblocks3; isimd++) {
         int start_idx = simdmat.simd_ptr[isimd];
         int end_idx = simdmat.simd_ptr[isimd + 1];
 #ifdef INROW_SIMD
-        VAL_VEC_TYPE y_vec(0);
-        for (int idx = start_idx; idx < end_idx; idx += SIMD_WIDTH) {
-            IDX_VEC_TYPE idx_vec = IDX_VEC_TYPE::load_unaligned(&simdmat.col_idx[idx]);
-            VAL_VEC_TYPE x_vec = VAL_VEC_TYPE::gather(x, idx_vec);
-            VAL_VEC_TYPE val_vec = VAL_VEC_TYPE::load_aligned(&simdmat.nnz_val[idx]);
-            y_vec = xsimd::fma(val_vec, x_vec, y_vec);
+        if ( isimd >= nsimdblocks2 ) {
+            VAL_VEC_TYPE y_vec(0);
+            for (int idx = start_idx; idx < end_idx; idx += SIMD_WIDTH) {
+                IDX_VEC_TYPE idx_vec = IDX_VEC_TYPE::load_unaligned(&simdmat.col_idx[idx]);
+                VAL_VEC_TYPE x_vec = VAL_VEC_TYPE::gather(x, idx_vec);
+                VAL_VEC_TYPE val_vec = VAL_VEC_TYPE::load_unaligned(&simdmat.nnz_val[idx]);
+                y_vec = xsimd::fma(val_vec, x_vec, y_vec);
+            }
+            y[simdmat.sort_raw[simdmat.nrows_crossrow_simd + isimd - nsimdblocks1]] = xsimd::reduce_add(y_vec);
         }
-        y[simdmat.sort_raw[start_row_idx_inrow + isimd - simdmat.nsimdblocks_crossrow]] = xsimd::reduce_add(y_vec);
-#else
-        int raw_row_idx = simdmat.sort_raw[start_row_idx_inrow + isimd - simdmat.nsimdblocks_crossrow];
-        y[raw_row_idx] = 0;
-        for (int idx = start_idx; idx < end_idx; idx++)
-            y[raw_row_idx] += simdmat.nnz_val[idx] * x[simdmat.col_idx[idx]];
+        else
+#endif
+        {
+            int raw_row_idx = simdmat.sort_raw[simdmat.nrows_crossrow_simd + isimd - nsimdblocks1];
+            y[raw_row_idx] = 0;
+            for (int idx = start_idx; idx < end_idx; idx++)
+                y[raw_row_idx] += simdmat.nnz_val[idx] * x[simdmat.col_idx[idx]];
+        }
+    }
+}
+
+template <typename T, typename U, class Arch>
+void SPMV_SIMD(std::vector<SIMDMAT<T, U>> &vsimdmat, std::vector<int> &vstartrow, std::vector<double> &vtimethread, T *x, T *y, int nthreads = 1) {
+    #pragma omp parallel for num_threads(nthreads) schedule(static)
+    for (int ithread = 0; ithread < nthreads; ithread++) {
+#ifdef THREAD_TIME_TEST
+        auto start = std::chrono::high_resolution_clock::now();
+#endif
+        SPMV_SIMD_thread<T, U, Arch>(vsimdmat[ithread], x, &y[vstartrow[ithread]]);
+#ifdef THREAD_TIME_TEST
+        auto end = std::chrono::high_resolution_clock::now();
+        double time_thread = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+        vtimethread[ithread] += time_thread;
 #endif
     }
 }
 
+template <typename T, typename U>
+std::vector<SIMDMAT<T, U>> thread_partition(CSR::CSRMAT<T> *csrmat, int nthreads = 1) {
+    std::vector<SIMDMAT<T, U>> vsimdmat;
+    vsimdmat.reserve(nthreads);
+    int N_DATAYPE_CACHELINE = sysconf(_SC_LEVEL1_DCACHE_LINESIZE) / sizeof(T);
+    int nnz_per_thread = csrmat->nnzs / nthreads;
+
+    int start_row = 0, end_row = 0;
+    for (int ithread = 0; ithread < nthreads; ithread++) {
+        while ( csrmat->row_ptr[end_row] - csrmat->row_ptr[start_row] < nnz_per_thread && end_row < csrmat->nrows )
+            end_row += N_DATAYPE_CACHELINE;
+        if ( end_row >= csrmat->nrows )
+            end_row = csrmat->nrows;
+
+        int nrows = end_row - start_row;
+        std::vector<int> row_ptr(nrows + 1);
+        for (int i = 0; i < nrows + 1; i++)
+            row_ptr[i] = csrmat->row_ptr[start_row + i] - csrmat->row_ptr[start_row];
+
+        vsimdmat.emplace_back(nrows, row_ptr.data(), &csrmat->col_idx[csrmat->row_ptr[start_row]], &csrmat->nnz_val[csrmat->row_ptr[start_row]], nthreads);
+
+        start_row = end_row;
+    }
+    return vsimdmat;
+}
+
 int main(int argc, char *argv[]) {
-    
+
     CSR::CSRMAT<DATATYPE> *csrmat;
     
     int nloops = DEFAULT_NLOOPS;
@@ -301,7 +329,11 @@ int main(int argc, char *argv[]) {
     // preprocess matrix
     auto start = std::chrono::high_resolution_clock::now();
 
-    SIMDMAT<DATATYPE, INDEXTYPE> simdmat(csrmat->nrows, csrmat->row_ptr, csrmat->col_idx, csrmat->nnz_val);
+    std::vector<SIMDMAT<DATATYPE, INDEXTYPE>> vsimdmat = thread_partition<DATATYPE, INDEXTYPE>(csrmat, nthreads);
+    std::vector<int> vstartrow(nthreads);
+    for (int i = 0; i < nthreads; i++) {
+        vstartrow[i] = (i == 0) ? 0 : vstartrow[i - 1] + vsimdmat[i - 1].nrows;
+    }
 
     auto end = std::chrono::high_resolution_clock::now();
     double time_preprocess = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
@@ -311,6 +343,8 @@ int main(int argc, char *argv[]) {
     DATATYPE *x = (DATATYPE*)malloc(csrmat->ncols * sizeof(DATATYPE));
     DATATYPE *y1 = (DATATYPE*)malloc(csrmat->nrows * sizeof(DATATYPE));
     DATATYPE *y2 = (DATATYPE*)malloc(csrmat->nrows * sizeof(DATATYPE));
+    //DATATYPE *y2;
+    //posix_memalign((void**)&y2, sysconf(_SC_LEVEL1_DCACHE_LINESIZE), csrmat->nrows * sizeof(DATATYPE));
     for (int i = 0; i < csrmat->ncols; i++)
         x[i] = static_cast<DATATYPE>(1);
     for (int i = 0; i < csrmat->nrows; i++) {
@@ -340,24 +374,38 @@ int main(int argc, char *argv[]) {
     using Arch = xsimd::avx512f;
 #endif
 
+    std::vector<double> vtimethread(nthreads, 0.0);
+
     // SIMD warmup
     for (int i = 0; i < 100; i++)
-        SPMV_SIMD<DATATYPE, INDEXTYPE, Arch>(simdmat, x, y2, nthreads);
+        SPMV_SIMD<DATATYPE, INDEXTYPE, Arch>(vsimdmat, vstartrow, vtimethread, x, y2, nthreads);
     
     // SIMD test
+    vtimethread.resize(nthreads, 0.0);
     auto start2 = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < nloops; i++)
-        SPMV_SIMD<DATATYPE, INDEXTYPE, Arch>(simdmat, x, y2, nthreads);
+        SPMV_SIMD<DATATYPE, INDEXTYPE, Arch>(vsimdmat, vstartrow, vtimethread, x, y2, nthreads);
     auto end2 = std::chrono::high_resolution_clock::now();
     double time_spmv_simd = std::chrono::duration_cast<std::chrono::microseconds>(end2 - start2).count();
     std::cout << "Time of SIMD SPMV:" << '\t' << time_spmv_simd / nloops << " us" << '\t' << '\t' << csrmat->nnzs * 2 / (time_spmv_simd / nloops) / 1000 << " GFLOPS" << std::endl;
     std::cout << "Speedup:" << '\t' << '\t' << time_spmv_csr / time_spmv_simd << "x" << '\n' << std::endl;
 
+#ifdef THREAD_TIME_TEST
+    for (int i = 0; i < nthreads; i++)
+        std::cout << "Thread " << i << ":" << '\t' 
+                  << "time = " << vtimethread[i] / nloops << " us" << '\t' 
+                  << "gflops = " << vsimdmat[i].nnzs * 2 / (vtimethread[i] / nloops) / 1000 << " GFLOPS" << '\t' 
+                  << "nrows = " << vsimdmat[i].nrows << '\t' 
+                  << "nnzs = " << vsimdmat[i].nnzs << '\t' 
+                  << "nsimdblocks = " << vsimdmat[i].nsimdblocks 
+                  << std::endl;
+#endif
+
     ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     
     // verify results
     CSR::SPMV_CSR<DATATYPE>(csrmat, x, y1);
-    SPMV_SIMD<DATATYPE, INDEXTYPE, Arch>(simdmat, x, y2);
+    SPMV_SIMD<DATATYPE, INDEXTYPE, Arch>(vsimdmat, vstartrow, vtimethread, x, y2);
 
     // compare y1 and y2
     for (int i = 0; i < csrmat->nrows; i++) {
