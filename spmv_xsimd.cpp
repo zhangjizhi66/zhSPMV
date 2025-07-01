@@ -1,18 +1,10 @@
 
 #include <iostream>
 #include <iomanip>
-#include <string>
-#include <fstream>
-#include <filesystem>
 #include <vector>
-#include <set>
-#include <random>
-#include <algorithm>
-#include <cmath>
-#include <numeric>
-#include <ctime>
 #include <chrono>
 #include <immintrin.h>
+#include <omp.h>
 #include "xsimd/xsimd.hpp"
 #include "new_gather_scatter.hpp"
 #include "csr.h"

@@ -53,11 +53,6 @@ namespace CSR {
             break;
         }
 
-        if ( nrows != ncols ) {
-            std::cerr << "Error: Matrix is not square." << std::endl;
-            exit(1);
-        }
-
         nnz_val = new T[nnzs];
         col_idx = new int[nnzs];
         row_ptr = new int[nrows + 1];
@@ -188,10 +183,10 @@ namespace CSR {
             exit(1);
         }
 
-        int nrows;
-        auto [ptr, ec] = std::from_chars(argv[1], argv[1] + strlen(argv[1]), nrows);
+        char* endptr;
+        int nrows = std::strtol(argv[1], &endptr, 10);
 
-        if ( ec == std::errc::invalid_argument ) {
+        if ( *endptr != '\0' ) {
             std::string MtxFileName = argv[1];
             csrmat = new CSRMAT<T>(MtxFileName);
             if ( argc > 2 ) nloops = std::stoi(argv[2]);
@@ -213,11 +208,17 @@ namespace CSR {
 
     template <typename T>
     void SPMV_CSR(CSRMAT<T> *csrmat, T *x, T *y, int nthreads = 1) {
-        #pragma omp parallel for num_threads(nthreads) schedule(dynamic)
-        for (int i = 0; i < csrmat->nrows; i++) {
-            y[i] = 0;
-            for (int j = csrmat->row_ptr[i]; j < csrmat->row_ptr[i + 1]; j++)
-                y[i] += csrmat->nnz_val[j] * x[csrmat->col_idx[j]];
+        int nrows_per_thread = (csrmat->nrows + nthreads - 1) / nthreads;
+        #pragma omp parallel for num_threads(nthreads) schedule(static)
+        for (int ithread = 0; ithread < nthreads; ithread++) {
+            int start_row = ithread * nrows_per_thread;
+            int end_row = std::min(start_row + nrows_per_thread, csrmat->nrows);
+            for (int i = start_row; i < end_row; i++) {
+                double sum = 0;
+                for (int j = csrmat->row_ptr[i]; j < csrmat->row_ptr[i + 1]; j++)
+                    sum += csrmat->nnz_val[j] * x[csrmat->col_idx[j]];
+                y[i] = sum;
+            }
         }
     }
 

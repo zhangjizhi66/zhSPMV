@@ -131,7 +131,7 @@ SIMDMAT<T, U>::SIMDMAT(CSR::CSRMAT<T> *csrmat) {
     nrows_inrow_simd = in_row_simd.size() - 1;
     nrows_crossrow_simd = nrows - nrows_inrow_simd;
     for (int j = 0; j < nrows_inrow_simd; j++) {
-        for (int i = in_row_simd[j] + 1; i < in_row_simd[j+1]; i++) {
+        for (int i = in_row_simd[j] + 1; i < in_row_simd[j + 1]; i++) {
             rows[i - j - 1].rawidx = rows[i].rawidx;
             rows[i - j - 1].first_col_idx = rows[i].first_col_idx;
             rows[i - j - 1].length = rows[i].length;
@@ -170,7 +170,7 @@ SIMDMAT<T, U>::SIMDMAT(CSR::CSRMAT<T> *csrmat) {
 
     // cross-row simd blocks
     for (int irow = 0; irow < int(nrows - nrows_inrow_simd - SIMD_WIDTH / 2); irow += SIMD_WIDTH / 2) {
-        int max_idx = csrmat->row_ptr[sort_raw[irow]+1] - csrmat->row_ptr[sort_raw[irow]];
+        int max_idx = csrmat->row_ptr[sort_raw[irow] + 1] - csrmat->row_ptr[sort_raw[irow]];
         for (int idx = 0; idx < max_idx; idx++) {
             for (int i = 0; i < int(SIMD_WIDTH / 2); i++) {
                 int raw_row_idx = sort_raw[irow + i];
@@ -345,15 +345,22 @@ void SPMV_SIMD_complex(SIMDMAT<T, U> &simdmat, T *x, T *y, int nthreads = 1) {
 
 template <typename T>
 void SPMV_CSR_complex(CSR::CSRMAT<T> *csrmat, T *x, T *y, int nthreads = 1) {
-    //#pragma omp parallel for num_threads(nthreads) schedule(dynamic)
-    for (int i = 0; i < csrmat->nrows; i++) {
-        y[2 * i] = 0;
-        for (int j = csrmat->row_ptr[i]; j < csrmat->row_ptr[i + 1]; j++)
-            y[2 * i] += csrmat->nnz_val[j] * x[csrmat->col_idx[j]];
+    int nrows_per_thread = (csrmat->nrows + nthreads - 1) / nthreads;
+    #pragma omp parallel for num_threads(nthreads) schedule(static)
+    for (int ithread = 0; ithread < nthreads; ithread++) {
+        int start_row = ithread * nrows_per_thread;
+        int end_row = std::min(start_row + nrows_per_thread, csrmat->nrows);
+        for (int i = start_row; i < end_row; i++) {
+            double sum1 = 0;
+            for (int j = csrmat->row_ptr[i]; j < csrmat->row_ptr[i + 1]; j++)
+                sum1 += csrmat->nnz_val[j] * x[csrmat->col_idx[j]];
+            y[2 * i] = sum1;
 
-        y[2 * i + 1] = 0;
-        for (int j = csrmat->row_ptr[i]; j < csrmat->row_ptr[i + 1]; j++)
-            y[2 * i + 1] += csrmat->nnz_val[j] * x[csrmat->col_idx[j]];
+            double sum2 = 0;
+            for (int j = csrmat->row_ptr[i]; j < csrmat->row_ptr[i + 1]; j++)
+                sum2 += csrmat->nnz_val[j] * x[csrmat->col_idx[j]];
+            y[2 * i + 1] = sum2;
+        }
     }
 }
 

@@ -7,7 +7,7 @@ NVCC = nvcc
 CFLAGS += -O3
 #CFLAGS += -g -Wall -Wextra -pedantic
 #CFLAGS += -O0 -fno-inline
-CFLAGS += -std=c++17
+CFLAGS += -std=c++11
 CFLAGS += -march=native
 CFLAGS += -fopenmp
 CFLAGS += -mavx -mavx2 -mfma
@@ -15,10 +15,10 @@ CFLAGS += -mavx512f -mavx512vl -mavx512dq -mavx512cd -mavx512bw
 
 # nvcc compiler flags
 NVCCFLAGS += -O3
-NVCCFLAGS += -std=c++17
+NVCCFLAGS += -std=c++11
 #NVCCFLAGS += -lcuda -lcudart
 
-TARGET = spmv_avx256d spmv_avx512d spmv_xsimd256d spmv_xsimd512d spmv_xsimd256d_thread spmv_xsimd512d_thread spmv_xsimd256d_complex_test spmv_xsimd512d_complex_test spmv_cuda
+TARGET = spmv_avx256d spmv_avx512d spmv_avx256d_thread spmv_avx512d_thread spmv_xsimd256d spmv_xsimd512d spmv_xsimd256d_thread spmv_xsimd512d_thread spmv_xsimd256d_complex_test spmv_xsimd512d_complex_test spmv_xsimd256d_thread_complex_test spmv_xsimd512d_thread_complex_test spmv_cuda
 
 all: $(TARGET)
 
@@ -28,6 +28,14 @@ spmv_avx256d: spmv_avx.cpp
 
 spmv_avx512d: spmv_avx.cpp
 	$(CXX) $(CFLAGS) -DVEC_LENGTH=512 -DDATATYPE=double -o $@ $<
+	@echo "Build complete!"
+
+spmv_avx256d_thread: spmv_avx_thread.cpp
+	$(CXX) $(CFLAGS) -Iinclude -DVEC_LENGTH=256 -DDATATYPE=double -o $@ $<
+	@echo "Build complete!"
+
+spmv_avx512d_thread: spmv_avx_thread.cpp
+	$(CXX) $(CFLAGS) -Iinclude -DVEC_LENGTH=512 -DDATATYPE=double -o $@ $<
 	@echo "Build complete!"
 
 spmv_xsimd256d: spmv_xsimd.cpp
@@ -51,6 +59,14 @@ spmv_xsimd256d_complex_test: spmv_xsimd_complex_test.cpp
 	@echo "Build complete!"
 
 spmv_xsimd512d_complex_test: spmv_xsimd_complex_test.cpp
+	$(CXX) $(CFLAGS) -Iinclude -DVEC_LENGTH=512 -DDATATYPE=double -o $@ $<
+	@echo "Build complete!"
+
+spmv_xsimd256d_thread_complex_test: spmv_xsimd_thread_complex_test.cpp
+	$(CXX) $(CFLAGS) -Iinclude -DVEC_LENGTH=256 -DDATATYPE=double -o $@ $<
+	@echo "Build complete!"
+
+spmv_xsimd512d_thread_complex_test: spmv_xsimd_thread_complex_test.cpp
 	$(CXX) $(CFLAGS) -Iinclude -DVEC_LENGTH=512 -DDATATYPE=double -o $@ $<
 	@echo "Build complete!"
 

@@ -5,8 +5,6 @@
 #include <chrono>
 #include <immintrin.h>
 #include <omp.h>
-#include "xsimd/xsimd.hpp"
-#include "new_gather_scatter.hpp"
 #include "csr.h"
 
 //#define VEC_LENGTH 256
@@ -209,26 +207,22 @@ SIMDMAT<T, U>::SIMDMAT(int csr_nrows, int *csr_row_ptr, U *csr_col_idx, T *csr_n
     }
 }
 
-template <typename T, typename U, class Arch>
-void SPMV_SIMD_thread(SIMDMAT<T, U> &simdmat, T *x, T *y) {
-    using VAL_VEC_TYPE = xsimd::batch<T, Arch>;
-    using IDX_VEC_TYPE = xsimd::batch<U, Arch>;
-
+void SPMV_SIMD256d_thread(SIMDMAT<double, int32_t> &simdmat, double *x, double *y) {
     // cross-row simd blocks
     int start_simd = 0;
     int end_simd = simdmat.nrows_crossrow_simd / SIMD_WIDTH;
     for (int isimd = start_simd; isimd < end_simd; isimd++) {
-        VAL_VEC_TYPE y_vec(0);
+        __m256d y_vec = _mm256_setzero_pd();
         int start_idx = simdmat.simd_ptr[isimd];
         int end_idx = simdmat.simd_ptr[isimd + 1];
         for (int idx = start_idx; idx < end_idx; idx += SIMD_WIDTH) {
-            IDX_VEC_TYPE idx_vec = IDX_VEC_TYPE::load_unaligned(&simdmat.col_idx[idx]);
-            VAL_VEC_TYPE x_vec = VAL_VEC_TYPE::gather(x, idx_vec);
-            VAL_VEC_TYPE val_vec = VAL_VEC_TYPE::load_unaligned(&simdmat.nnz_val[idx]);
-            y_vec = xsimd::fma(val_vec, x_vec, y_vec);
+            __m128i idx_vec = _mm_loadu_si128((__m128i *)&simdmat.col_idx[idx]);
+            __m256d x_vec = _mm256_i32gather_pd(x, idx_vec, sizeof(double));
+            __m256d val_vec = _mm256_load_pd(&simdmat.nnz_val[idx]);
+            y_vec = _mm256_fmadd_pd(val_vec, x_vec, y_vec);
         }
-        IDX_VEC_TYPE row_idx_vec = IDX_VEC_TYPE::load_unaligned(&simdmat.sort_raw[isimd * SIMD_WIDTH]);
-        y_vec.scatter(y, row_idx_vec);
+        __m128i row_idx_vec = _mm_loadu_si128((__m128i *)&simdmat.sort_raw[isimd * SIMD_WIDTH]);
+        _mm256_i32scatter_pd(y, row_idx_vec, y_vec, sizeof(double));
     }
 
     // scalar rows & in-row simd rows
@@ -240,14 +234,16 @@ void SPMV_SIMD_thread(SIMDMAT<T, U> &simdmat, T *x, T *y) {
         int end_idx = simdmat.simd_ptr[isimd + 1];
 #ifdef INROW_SIMD
         if ( isimd >= nsimdblocks2 ) {
-            VAL_VEC_TYPE y_vec(0);
+            __m256d y_vec = _mm256_setzero_pd();
             for (int idx = start_idx; idx < end_idx; idx += SIMD_WIDTH) {
-                IDX_VEC_TYPE idx_vec = IDX_VEC_TYPE::load_unaligned(&simdmat.col_idx[idx]);
-                VAL_VEC_TYPE x_vec = VAL_VEC_TYPE::gather(x, idx_vec);
-                VAL_VEC_TYPE val_vec = VAL_VEC_TYPE::load_unaligned(&simdmat.nnz_val[idx]);
-                y_vec = xsimd::fma(val_vec, x_vec, y_vec);
+                __m128i idx_vec = _mm_loadu_si128((__m128i *)&simdmat.col_idx[idx]);
+                __m256d x_vec = _mm256_i32gather_pd(x, idx_vec, sizeof(double));
+                __m256d val_vec = _mm256_load_pd(&simdmat.nnz_val[idx]);
+                y_vec = _mm256_fmadd_pd(val_vec, x_vec, y_vec);
             }
-            y[simdmat.sort_raw[simdmat.nrows_crossrow_simd + isimd - nsimdblocks1]] = xsimd::reduce_add(y_vec);
+            double y_arr[SIMD_WIDTH];
+            _mm256_storeu_pd(y_arr, y_vec);
+            y[simdmat.sort_raw[simdmat.nrows_crossrow_simd + isimd - nsimdblocks1]] = std::accumulate(y_arr, y_arr + SIMD_WIDTH, 0.0);
         }
         else
 #endif
@@ -260,15 +256,71 @@ void SPMV_SIMD_thread(SIMDMAT<T, U> &simdmat, T *x, T *y) {
     }
 }
 
-template <typename T, typename U, class Arch>
+void SPMV_SIMD512d_thread(SIMDMAT<double, int32_t> &simdmat, double *x, double *y) {
+    // cross-row simd blocks
+    int start_simd = 0;
+    int end_simd = simdmat.nrows_crossrow_simd / SIMD_WIDTH;
+    for (int isimd = start_simd; isimd < end_simd; isimd++) {
+        __m512d y_vec = _mm512_setzero_pd();
+        int start_idx = simdmat.simd_ptr[isimd];
+        int end_idx = simdmat.simd_ptr[isimd + 1];
+        for (int idx = start_idx; idx < end_idx; idx += SIMD_WIDTH) {
+            __m256i idx_vec = _mm256_loadu_si256((__m256i *)&simdmat.col_idx[idx]);
+            __m512d x_vec = _mm512_i32gather_pd(idx_vec, x, sizeof(double));
+            __m512d val_vec = _mm512_load_pd(&simdmat.nnz_val[idx]);
+            y_vec = _mm512_fmadd_pd(val_vec, x_vec, y_vec);
+        }
+        __m256i row_idx_vec = _mm256_loadu_si256((__m256i *)&simdmat.sort_raw[isimd * SIMD_WIDTH]);
+        _mm512_i32scatter_pd(y, row_idx_vec, y_vec, sizeof(double));
+    }
+
+    // scalar rows & in-row simd rows
+    int nsimdblocks1 = simdmat.nrows_crossrow_simd / SIMD_WIDTH;
+    int nsimdblocks2 = nsimdblocks1 + simdmat.nrows_scalar;
+    int nsimdblocks3 = nsimdblocks2 + simdmat.nrows_inrow_simd;
+    for (int isimd = nsimdblocks1; isimd < nsimdblocks3; isimd++) {
+        int start_idx = simdmat.simd_ptr[isimd];
+        int end_idx = simdmat.simd_ptr[isimd + 1];
+#ifdef INROW_SIMD
+        if (isimd >= nsimdblocks2) {
+            __m512d y_vec = _mm512_setzero_pd();
+            for (int idx = start_idx; idx < end_idx; idx += SIMD_WIDTH) {
+                __m256i idx_vec = _mm256_loadu_si256((__m256i *)&simdmat.col_idx[idx]);
+                __m512d x_vec = _mm512_i32gather_pd(idx_vec, x, sizeof(double));
+                __m512d val_vec = _mm512_load_pd(&simdmat.nnz_val[idx]);
+                y_vec = _mm512_fmadd_pd(val_vec, x_vec, y_vec);
+            }
+            double y_arr[SIMD_WIDTH];
+            _mm512_storeu_pd(y_arr, y_vec);
+            y[simdmat.sort_raw[simdmat.nrows_crossrow_simd + isimd - nsimdblocks1]] = std::accumulate(y_arr, y_arr + SIMD_WIDTH, 0.0);
+        }
+        else
+#endif
+        {
+            int raw_row_idx = simdmat.sort_raw[simdmat.nrows_crossrow_simd + isimd - nsimdblocks1];
+            y[raw_row_idx] = 0;
+            for (int idx = start_idx; idx < end_idx; idx++)
+                y[raw_row_idx] += simdmat.nnz_val[idx] * x[simdmat.col_idx[idx]];
+        }
+    }
+}
+
+template <typename T, typename U>
 void SPMV_SIMD(std::vector<SIMDMAT<T, U>> &vsimdmat, std::vector<int> &vstartrow, std::vector<double> &vtimethread, T *x, T *y, int nthreads = 1) {
     #pragma omp parallel for num_threads(nthreads) schedule(static)
     for (int ithread = 0; ithread < nthreads; ithread++) {
 #ifdef THREAD_TIME_TEST
         auto start = std::chrono::high_resolution_clock::now();
 #endif
-
-        SPMV_SIMD_thread<T, U, Arch>(vsimdmat[ithread], x, &y[vstartrow[ithread]]);
+        
+#if DATATYPE == double && VEC_LENGTH == 256
+        SPMV_SIMD256d_thread(vsimdmat[ithread], x, &y[vstartrow[ithread]]);
+#elif DATATYPE == double && VEC_LENGTH == 512
+        SPMV_SIMD512d_thread(vsimdmat[ithread], x, &y[vstartrow[ithread]]);
+#else
+        std::cerr << "Unsupported DATATYPE or VEC_LENGTH!" << std::endl;
+        exit(EXIT_FAILURE);
+#endif
 
 #ifdef THREAD_TIME_TEST
         auto end = std::chrono::high_resolution_clock::now();
@@ -439,23 +491,17 @@ int main(int argc, char *argv[]) {
 
     ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-#if VEC_LENGTH == 256
-    using Arch = xsimd::avx2;
-#elif VEC_LENGTH == 512
-    using Arch = xsimd::avx512f;
-#endif
-
     std::vector<double> vtimethread(nthreads, 0.0);
 
     // SIMD warmup
     for (int i = 0; i < 100; i++)
-        SPMV_SIMD<DATATYPE, INDEXTYPE, Arch>(vsimdmat, vstartrow, vtimethread, x, y2, nthreads);
+        SPMV_SIMD<DATATYPE, INDEXTYPE>(vsimdmat, vstartrow, vtimethread, x, y2, nthreads);
     
     // SIMD test
     vtimethread.resize(nthreads, 0.0);
     auto start2 = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < nloops; i++)
-        SPMV_SIMD<DATATYPE, INDEXTYPE, Arch>(vsimdmat, vstartrow, vtimethread, x, y2, nthreads);
+        SPMV_SIMD<DATATYPE, INDEXTYPE>(vsimdmat, vstartrow, vtimethread, x, y2, nthreads);
     auto end2 = std::chrono::high_resolution_clock::now();
     double time_spmv_simd = std::chrono::duration_cast<std::chrono::microseconds>(end2 - start2).count();
     std::cout << "Time of SIMD SPMV:" << '\t' << time_spmv_simd / nloops << " us" << '\t' << '\t' << csrmat->nnzs * 2 / (time_spmv_simd / nloops) / 1000 << " GFLOPS" << std::endl;
@@ -480,7 +526,7 @@ int main(int argc, char *argv[]) {
     
     // verify results
     CSR::SPMV_CSR<DATATYPE>(csrmat, x, y1);
-    SPMV_SIMD<DATATYPE, INDEXTYPE, Arch>(vsimdmat, vstartrow, vtimethread, x, y2);
+    SPMV_SIMD<DATATYPE, INDEXTYPE>(vsimdmat, vstartrow, vtimethread, x, y2);
 
     // compare y1 and y2
     for (int i = 0; i < csrmat->nrows; i++) {
